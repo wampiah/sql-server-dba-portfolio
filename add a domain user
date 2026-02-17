@@ -1,0 +1,49 @@
+---Script to add a domain user to Pharmaceuticals Databank
+/*
+  Author:        William Ampiah
+  Date:          16-10-2023
+  Description:   Script to add a domain user to Pharmaceuticals Databank
+  Version:       1.0.1
+  Modified By:   Me
+  Modified Date: 04-07-2024
+  Change Notes:  Used dynamic SQL (sp_executesql) to execute CREATE LOGIN (Step 1)
+*/
+
+-- Define variables
+DECLARE @DomainUser NVARCHAR(100) = ‘domain\joedoe'; -- Replace with the domain user
+DECLARE @DatabaseName NVARCHAR(100) = ‘Pharmaceuticals’; -- Replace with your database name
+
+-- Step 1: Create a login for the domain user if it doesn't already exist
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = @DomainUser)
+BEGIN
+    PRINT 'Creating login for the domain user...';
+    EXEC('CREATE LOGIN [' + @DomainUser + '] FROM WINDOWS WITH DEFAULT_DATABASE = [' + @DatabaseName + '];');
+    PRINT 'Login created successfully.';
+END
+ELSE
+BEGIN
+    PRINT 'Login already exists.';
+END
+
+-- Step 2: Add the user to the specific database
+DECLARE @Sql NVARCHAR(MAX) = 
+    'USE [' + @DatabaseName + ']; ' +
+    'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = ''' + @DomainUser + ''') ' +
+    'BEGIN ' +
+    '    CREATE USER [' + @DomainUser + '] FOR LOGIN [' + @DomainUser + ']; ' +
+    '    PRINT ''User added to database successfully.''; ' +
+    'END ' +
+    'ELSE ' +
+    'BEGIN ' +
+    '    PRINT ''User already exists in the database.''; ' +
+    'END';
+EXEC sp_executesql @Sql;
+
+-- Step 3: Grant necessary permissions to the user
+DECLARE @PermissionSql NVARCHAR(MAX) = 
+    'USE [' + @DatabaseName + ']; ' +
+    'ALTER ROLE [db_owner] ADD MEMBER [' + @DomainUser + ']; ' +
+    'ALTER ROLE [db_datareader] ADD MEMBER [' + @DomainUser + ']; ' +
+    'ALTER ROLE [MIPharmacist] ADD MEMBER [' + @DomainUser + ']; ' +
+    'PRINT ''Permissions granted.'';';
+EXEC sp_executesql @PermissionSql;
