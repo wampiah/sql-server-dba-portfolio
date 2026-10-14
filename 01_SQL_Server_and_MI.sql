@@ -1,4 +1,4 @@
-/* DBA DAILY CHECKS v1.8 | SQL Server 2012-2022 and Azure SQL Managed Instance
+/* DBA DAILY CHECKS v1.11 | SQL Server 2012-2022 and Azure SQL Managed Instance
    Run once per instance in SSMS, preferably first against one server.
    No persistent writes or maintenance. Uses session temp tables only.
    UTC window for XE; backup/job/CommandLog times use server-local GETDATE().
@@ -9,6 +9,8 @@
 SET NOCOUNT ON;
 DECLARE @OldLockTimeout int = @@LOCK_TIMEOUT;
 DECLARE @Hours int=24, @BlockingSeconds int=60,
+        @DataBackupMaxAgeHours int=48, -- overdue threshold, independent of @Hours
+        @DataBackupMode varchar(10)='FULL_DIFF', -- FULL_DIFF = latest full/differential; FULL = full only
         @ExceptionsOnly bit=0, -- 1 = output CRITICAL, ATTENTION, REVIEW and NOT CHECKED only
         @DiskWarningPct decimal(5,2)=15, @DiskCriticalPct decimal(5,2)=10,
         @FileUsedWarningPct decimal(5,2)=90,
@@ -26,8 +28,40 @@ DECLARE @Now datetime=GETDATE(), @Utc datetime2=SYSUTCDATETIME(),
 SET @Since=DATEADD(hour,-@Hours,@Now); SET @SinceUtc=DATEADD(hour,-@Hours,@Utc);
 -- NULL would make every 'name<>@x' test unknown and silently empty the database checks.
 SET @MaintenanceDatabase=ISNULL(@MaintenanceDatabase,N'');
+-- EDIT EXCLUSIONS HERE. Names must match SERVERPROPERTY('ServerName'), not registration aliases.
+IF OBJECT_ID('tempdb..#ExcludedServers') IS NOT NULL DROP TABLE #ExcludedServers;
+CREATE TABLE #ExcludedServers(ServerName nvarchar(256) COLLATE DATABASE_DEFAULT NOT NULL PRIMARY KEY);
+-- Examples only: uncomment and replace with your actual instance names.
+-- INSERT INTO #ExcludedServers(ServerName) VALUES (N'SQL-DEV01'),(N'SQL-OLD01\INSTANCE1');
+
+IF OBJECT_ID('tempdb..#ExcludedDatabases') IS NOT NULL DROP TABLE #ExcludedDatabases;
+CREATE TABLE #ExcludedDatabases
+ (DatabaseName nvarchar(128) COLLATE DATABASE_DEFAULT NOT NULL,
+  ServerName nvarchar(256) COLLATE DATABASE_DEFAULT NULL);
+-- NULL server = exclude this database name on every instance.
+-- INSERT INTO #ExcludedDatabases(DatabaseName,ServerName) VALUES (N'ObsoleteDatabase',NULL);
+-- Specify a server to exclude the database only on that instance.
+-- INSERT INTO #ExcludedDatabases(DatabaseName,ServerName) VALUES (N'TestDatabase',N'SQL-PROD01');
+
+IF EXISTS(SELECT 1 FROM #ExcludedServers WHERE ServerName=@Server COLLATE DATABASE_DEFAULT)
+BEGIN
+ SELECT @Utc CheckTimeUtc,@Server ServerName,CAST(@Server AS nvarchar(512)) Resource,
+ CAST(N'Server exclusion' AS nvarchar(100)) CheckName,CAST('N/A' AS varchar(20)) Status,
+ CAST(N'Instance intentionally excluded; daily checks skipped.' AS nvarchar(max)) Finding,
+ CAST(N'Explicit #ExcludedServers match; script version=1.11' AS nvarchar(max)) Evidence,
+ CAST(NULL AS nvarchar(100)) Ticket,CAST(NULL AS nvarchar(100)) Owner,CAST(NULL AS nvarchar(100)) NextUpdate;
+ RETURN; -- before monitoring, policy checks or changing LOCK_TIMEOUT
+END;
+IF OBJECT_ID('tempdb..#OmittedDatabases') IS NOT NULL DROP TABLE #OmittedDatabases;
+CREATE TABLE #OmittedDatabases(DatabaseName nvarchar(128) COLLATE DATABASE_DEFAULT NOT NULL PRIMARY KEY);
+INSERT INTO #OmittedDatabases(DatabaseName)
+ SELECT DISTINCT DatabaseName FROM #ExcludedDatabases
+ WHERE ServerName IS NULL OR ServerName=@Server COLLATE DATABASE_DEFAULT;
+
 IF @Hours<1 OR @Hours>168 THROW 50000,'Hours must be between 1 and 168.',1;
 IF @Engine IN (5,6) THROW 50000,'Use the Azure SQL Database script for SQL Database; Synapse is outside scope.',1;
+IF @DataBackupMaxAgeHours<1 OR @DataBackupMaxAgeHours>8760 THROW 50000,'Data backup age must be between 1 and 8760 hours.',1;
+IF @DataBackupMode NOT IN ('FULL','FULL_DIFF') THROW 50000,'DataBackupMode must be FULL or FULL_DIFF.',1;
 DECLARE @CanMonitor bit=CASE WHEN HAS_PERMS_BY_NAME(NULL,NULL,'VIEW SERVER STATE')=1
  OR HAS_PERMS_BY_NAME(NULL,NULL,'VIEW SERVER PERFORMANCE STATE')=1 THEN 1 ELSE 0 END;
 SET LOCK_TIMEOUT 3000;
@@ -48,6 +82,28 @@ CREATE TABLE #JobPolicy(JobName sysname PRIMARY KEY, MaxSuccessAgeHours int NOT 
 /* Example only: INSERT #JobPolicy VALUES(N'Your daily job',30,180);
    Include only jobs expected to run on THIS replica; account for schedules/holidays.
 */
+-- Known continuous RESTORING periods: suppress only Database state rows after seven days.
+-- Do not use database create_date or last restore-history date as a state start date.
+IF OBJECT_ID('tempdb..#RestoringExceptions') IS NOT NULL DROP TABLE #RestoringExceptions;
+CREATE TABLE #RestoringExceptions
+ (DatabaseName nvarchar(128) COLLATE DATABASE_DEFAULT NOT NULL,
+  ServerName nvarchar(256) COLLATE DATABASE_DEFAULT NULL,
+  RestoringSinceUtc datetime2 NOT NULL);
+-- Example only: replace names and use the verified UTC start of the current RESTORING period.
+-- NULL server means all instances with that database name; prefer an explicit instance.
+-- INSERT INTO #RestoringExceptions(DatabaseName,ServerName,RestoringSinceUtc)
+-- VALUES (N'LongTermRestore',N'SQL-PROD01','2026-10-01T08:00:00');
+
+-- Optional database-to-backup-job mapping; avoids guessing from job names.
+IF OBJECT_ID('tempdb..#BackupJobs') IS NOT NULL DROP TABLE #BackupJobs;
+CREATE TABLE #BackupJobs
+ (DatabaseName nvarchar(128) COLLATE DATABASE_DEFAULT NOT NULL,
+  ServerName nvarchar(256) COLLATE DATABASE_DEFAULT NULL,
+  JobName nvarchar(128) COLLATE DATABASE_DEFAULT NOT NULL);
+-- One job may be mapped to several databases; a failed job does not prove each database failed.
+-- INSERT INTO #BackupJobs(DatabaseName,ServerName,JobName)
+-- VALUES (N'ProductionDatabase',N'SQL-PROD01',N'DatabaseBackup - USER_DATABASES - FULL');
+
 INSERT INTO #Daily
  (CheckTimeUtc,ServerName,Resource,CheckName,Status,Finding,Evidence)
 VALUES
@@ -58,7 +114,8 @@ VALUES
    N'; server-local window=',CONVERT(varchar(30),@Since,126),N' to ',CONVERT(varchar(30),@Now,126),
    N'; UTC window=',CONVERT(varchar(30),@SinceUtc,126),N' to ',CONVERT(varchar(30),@Utc,126),
    N'; database scope=user databases except ',@MaintenanceDatabase,
-   N'; script version=1.8'));
+   N'; additional excluded database names=',(SELECT COUNT(*) FROM #OmittedDatabases),
+   N'; script version=1.11'));
 
 -- 01 Database inventory: permissions must cover ALL databases to call coverage complete.
 BEGIN TRY
@@ -70,7 +127,12 @@ BEGIN TRY
    CONCAT('State=',state_desc COLLATE DATABASE_DEFAULT,
           '; recovery=',recovery_model_desc COLLATE DATABASE_DEFAULT,'; read_only=',is_read_only),
    'sys.databases; compare non-ONLINE states with approved exceptions'
-  FROM sys.databases WHERE database_id>4 AND name<>@MaintenanceDatabase;
+  FROM sys.databases d WHERE d.database_id>4 AND d.name<>@MaintenanceDatabase
+  AND NOT EXISTS(SELECT 1 FROM #OmittedDatabases x WHERE x.DatabaseName=d.name COLLATE DATABASE_DEFAULT)
+  AND NOT (d.state=1 AND EXISTS(SELECT 1 FROM #RestoringExceptions r
+   WHERE r.DatabaseName=d.name COLLATE DATABASE_DEFAULT
+   AND (r.ServerName IS NULL OR r.ServerName=@Server COLLATE DATABASE_DEFAULT)
+   AND r.RestoringSinceUtc<DATEADD(day,-7,@Utc)));
  EXEC sp_executesql N'INSERT #Daily SELECT @u,@s,@s,''Instance start'',
    CASE WHEN sqlserver_start_time>=@since THEN ''REVIEW'' ELSE ''INFO'' END,
    CONCAT(''SQL start (server local)='',CONVERT(varchar(30),sqlserver_start_time,126)),
@@ -80,33 +142,77 @@ END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Database inventory and start','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
 
--- 02 Backup history: broad msdb visibility required, explicit policy avoids false passes.
+-- 02 Backup age: default latest successful full/differential older than 48 hours.
+-- Optional explicit policy and mapped-job failure evidence remain local to this instance.
 BEGIN TRY
  IF ISNULL(HAS_PERMS_BY_NAME(NULL,NULL,'VIEW ANY DATABASE'),0)<>1
   RAISERROR('Inventory visibility insufficient for backup coverage.',16,1);
  EXEC sp_executesql N'
- ;WITH b AS (SELECT database_name,
+ SELECT database_name,
  MAX(CASE WHEN type=''D'' AND is_copy_only=0 THEN backup_finish_date END) FullTime,
  MAX(CASE WHEN type=''I'' THEN backup_finish_date END) DiffTime,
- MAX(CASE WHEN type=''L'' THEN backup_finish_date END) LogTime
- FROM msdb.dbo.backupset GROUP BY database_name)
- INSERT #Daily
+ MAX(CASE WHEN type=''L'' THEN backup_finish_date END) LogTime,
+ MAX(CASE WHEN (type=''D'' AND is_copy_only=0) OR (@mode=''FULL_DIFF'' AND type=''I'')
+          THEN backup_finish_date END) DataTime
+ INTO #BackupAgeEvidence FROM msdb.dbo.backupset
+ WHERE backup_finish_date<=@n GROUP BY database_name;
+ CREATE TABLE #MappedBackupFailures
+ (DatabaseName nvarchar(128) COLLATE DATABASE_DEFAULT,
+  JobName nvarchar(128) COLLATE DATABASE_DEFAULT,FailedStart datetime,Outcome int);
+ DECLARE @JobEvidenceError nvarchar(4000)=NULL;
+ IF @engine<>4 AND EXISTS(SELECT 1 FROM #BackupJobs WHERE ServerName IS NULL OR ServerName=@s COLLATE DATABASE_DEFAULT)
+ BEGIN
+ BEGIN TRY
+  INSERT INTO #MappedBackupFailures(DatabaseName,JobName,FailedStart,Outcome)
+  SELECT m.DatabaseName,m.JobName,msdb.dbo.agent_datetime(h.run_date,h.run_time),h.run_status
+  FROM #BackupJobs m JOIN msdb.dbo.sysjobs j ON j.name COLLATE DATABASE_DEFAULT=m.JobName
+  JOIN msdb.dbo.sysjobhistory h ON h.job_id=j.job_id
+  WHERE (m.ServerName IS NULL OR m.ServerName=@s COLLATE DATABASE_DEFAULT)
+  AND h.step_id=0 AND h.run_status IN(0,3) AND h.run_date>0
+  AND msdb.dbo.agent_datetime(h.run_date,h.run_time)>=DATEADD(hour,-@age,@n)
+  AND msdb.dbo.agent_datetime(h.run_date,h.run_time)<=@n;
+ END TRY BEGIN CATCH
+  SET @JobEvidenceError=ERROR_MESSAGE();
+ END CATCH;
+ END;
+ INSERT INTO #Daily(CheckTimeUtc,ServerName,Resource,CheckName,Status,Finding,Evidence)
  SELECT @u,@s,d.name,''Backup freshness'',
- CASE WHEN p.DatabaseName IS NULL OR (d.recovery_model_desc<>''SIMPLE'' AND p.LogMaxAgeMinutes IS NULL) THEN ''REVIEW''
+ CASE WHEN b.DataTime IS NULL OR b.DataTime<DATEADD(hour,-@age,@n) THEN ''ATTENTION''
+ WHEN p.DatabaseName IS NULL OR (d.recovery_model_desc<>''SIMPLE'' AND p.LogMaxAgeMinutes IS NULL) THEN ''REVIEW''
  WHEN b.FullTime IS NULL OR b.FullTime<DATEADD(hour,-p.FullMaxAgeHours,@n)
  OR (p.DifferentialMaxAgeHours IS NOT NULL AND (b.DiffTime IS NULL OR b.DiffTime<DATEADD(hour,-p.DifferentialMaxAgeHours,@n)))
  OR (d.recovery_model_desc<>''SIMPLE'' AND p.LogMaxAgeMinutes IS NOT NULL AND (b.LogTime IS NULL OR b.LogTime<DATEADD(minute,-p.LogMaxAgeMinutes,@n)))
  THEN ''ATTENTION'' ELSE ''PASS'' END,
- CONCAT(''Full='',COALESCE(CONVERT(varchar(30),b.FullTime,126),''none locally''),
- ''; diff='',COALESCE(CONVERT(varchar(30),b.DiffTime,126),''none locally''),
- ''; log='',COALESCE(CONVERT(varchar(30),b.LogTime,126),''none locally''),
- CASE WHEN p.DatabaseName IS NULL THEN ''; no configured policy''
- WHEN d.recovery_model_desc<>''SIMPLE'' AND p.LogMaxAgeMinutes IS NULL THEN ''; no log policy configured'' ELSE ''; policy compared'' END),
- ''msdb.backupset; successful recorded backups only; local history; not restore verification''
- FROM sys.databases d LEFT JOIN b ON b.database_name COLLATE DATABASE_DEFAULT=d.name COLLATE DATABASE_DEFAULT
+ CONCAT(''Latest data backup='',COALESCE(CONVERT(varchar(30),b.DataTime,126),''none locally''),
+ ''; age hours='',CASE WHEN b.DataTime IS NULL THEN ''unknown''
+ ELSE CONVERT(varchar(30),CAST(DATEDIFF(minute,b.DataTime,@n)/60.0 AS decimal(18,2))) END,
+ ''; limit hours='',@age,''; mode='',@mode,
+ CASE WHEN b.DataTime IS NULL THEN ''; no successful qualifying backup visible''
+ WHEN b.DataTime<DATEADD(hour,-@age,@n) THEN ''; data backup overdue'' ELSE ''; data backup within age limit'' END,
+ CASE WHEN f.JobName IS NOT NULL THEN CONCAT(''; mapped job failed/cancelled='',f.JobName,
+ ''; job outcome start='',CONVERT(varchar(30),f.FailedStart,126)) ELSE '''' END,
+ CASE WHEN p.DatabaseName IS NULL THEN ''; no configured recovery policy''
+ WHEN d.recovery_model_desc<>''SIMPLE'' AND p.LogMaxAgeMinutes IS NULL THEN ''; no log policy configured'' ELSE ''; recovery policy compared'' END),
+ CONCAT(''Local msdb backup history; full='',COALESCE(CONVERT(varchar(30),b.FullTime,126),''none''),
+ ''; diff='',COALESCE(CONVERT(varchar(30),b.DiffTime,126),''none''),
+ ''; log='',COALESCE(CONVERT(varchar(30),b.LogTime,126),''none''),
+ ''; mapped failure lookup='',CASE WHEN @engine=4 THEN ''Agent excluded on Express''
+ WHEN @JobEvidenceError IS NOT NULL THEN @JobEvidenceError
+ WHEN NOT EXISTS(SELECT 1 FROM #BackupJobs m WHERE m.DatabaseName=d.name COLLATE DATABASE_DEFAULT
+   AND (m.ServerName IS NULL OR m.ServerName=@s COLLATE DATABASE_DEFAULT)) THEN ''no mapping supplied''
+ ELSE ''retained local job outcomes within backup-age window; confirm job visibility'' END,
+ ''; mapped failures after last qualifying backup are supporting evidence, not proof of cause; AG backups on other replicas need separate review'')
+ FROM sys.databases d LEFT JOIN #BackupAgeEvidence b
+ ON b.database_name COLLATE DATABASE_DEFAULT=d.name COLLATE DATABASE_DEFAULT
  LEFT JOIN #BackupPolicy p ON p.DatabaseName COLLATE DATABASE_DEFAULT=d.name COLLATE DATABASE_DEFAULT
- WHERE d.database_id>4 AND d.name<>@m AND d.state=0; ',
- N'@u datetime2,@s nvarchar(256),@n datetime,@m sysname',@Utc,@Server,@Now,@MaintenanceDatabase;
+ OUTER APPLY(SELECT TOP (1) x.JobName,x.FailedStart FROM #MappedBackupFailures x
+  WHERE x.DatabaseName=d.name COLLATE DATABASE_DEFAULT
+  AND (b.DataTime IS NULL OR x.FailedStart>b.DataTime)
+  ORDER BY x.FailedStart DESC,x.JobName) f
+ WHERE d.database_id>4 AND d.name<>@m AND d.state=0
+ AND NOT EXISTS(SELECT 1 FROM #OmittedDatabases x WHERE x.DatabaseName=d.name COLLATE DATABASE_DEFAULT); ',
+ N'@u datetime2,@s nvarchar(256),@n datetime,@m sysname,@age int,@mode varchar(10),@engine int',
+ @Utc,@Server,@Now,@MaintenanceDatabase,@DataBackupMaxAgeHours,@DataBackupMode,@Engine;
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Backup freshness','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
@@ -120,7 +226,8 @@ BEGIN TRY
    '; policy age days=',@IntegrityMaxAgeDays),
   'DATABASEPROPERTYEX LastGoodCheckDbTime; NULL/none on older versions or never checked; PHYSICAL_ONLY runs may not update it; AG secondaries need review'
  FROM sys.databases d CROSS APPLY (SELECT TRY_CONVERT(datetime,DATABASEPROPERTYEX(d.name,'LastGoodCheckDbTime'))) c(t)
- WHERE d.database_id>4 AND d.name<>@MaintenanceDatabase AND d.state=0;
+ WHERE d.database_id>4 AND d.name<>@MaintenanceDatabase AND d.state=0
+ AND NOT EXISTS(SELECT 1 FROM #OmittedDatabases x WHERE x.DatabaseName=d.name COLLATE DATABASE_DEFAULT);
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Last good CHECKDB','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
@@ -129,7 +236,8 @@ BEGIN TRY
  DECLARE @n int=(SELECT COUNT(*) FROM msdb.dbo.suspect_pages sp
  WHERE sp.event_type IN(1,2,3) AND sp.last_update_date>=@since
  AND EXISTS(SELECT 1 FROM sys.databases d WHERE d.database_id=sp.database_id
-            AND d.database_id>4 AND d.name<>@m));
+            AND d.database_id>4 AND d.name<>@m
+            AND NOT EXISTS(SELECT 1 FROM #OmittedDatabases x WHERE x.DatabaseName=d.name COLLATE DATABASE_DEFAULT)));
  INSERT #Daily VALUES(@u,@s,@s,''Suspect pages'',CASE WHEN @n>0 THEN ''ATTENTION'' ELSE ''PASS'' END,
  CONCAT(@n,'' suspect_pages rows for in-scope user databases (event types 1-3) updated in the window.''),
  ''msdb.dbo.suspect_pages; table is capped and cleared manually; PASS is not proof of no corruption'');',
@@ -138,6 +246,10 @@ END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Suspect pages','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
 
+-- SQL Server Express (EngineEdition=4) has no SQL Server Agent.
+-- Skip all Agent collection and output on Express.
+IF @Engine<>4
+BEGIN
 -- 03 Agent history: include failures even if subsequently retried successfully.
 BEGIN TRY
  EXEC sp_executesql N'
@@ -191,12 +303,14 @@ ELSE BEGIN
  ''sys.dm_server_services; Agent only''
  FROM sys.dm_server_services WHERE servicename LIKE N''SQL Server Agent%'';
  IF @@ROWCOUNT=0 INSERT #Daily VALUES(@u,@s,@s,''Agent service'',''REVIEW'',
- ''No SQL Server Agent service row visible (Express, Linux or permissions). Confirm Agent is expected.'',NULL);',
+ ''No SQL Server Agent service row visible (Linux or permissions). Confirm Agent is expected.'',NULL);',
  N'@u datetime2,@s nvarchar(256)',@Utc,@Server;
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Agent service','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
 END;
+
+END; -- Express Agent exclusion
 
 -- 04 Host volumes: only volumes containing SQL database files.
 IF @Engine=8
@@ -221,8 +335,9 @@ END;
 
 -- Per-database file and log space; offline/inaccessible DBs explicitly surfaced.
 DECLARE @db sysname,@sql nvarchar(max);
-DECLARE dbs CURSOR LOCAL FAST_FORWARD FOR SELECT name FROM sys.databases
- WHERE database_id>4 AND name<>@MaintenanceDatabase;
+DECLARE dbs CURSOR LOCAL FAST_FORWARD FOR SELECT d.name FROM sys.databases d
+ WHERE d.database_id>4 AND d.name<>@MaintenanceDatabase
+ AND NOT EXISTS(SELECT 1 FROM #OmittedDatabases x WHERE x.DatabaseName=d.name COLLATE DATABASE_DEFAULT);
 OPEN dbs; FETCH NEXT FROM dbs INTO @db;
 WHILE @@FETCH_STATUS=0 BEGIN
  BEGIN TRY
@@ -291,7 +406,8 @@ ELSE BEGIN
  JOIN sys.availability_databases_cluster adc ON adc.group_database_id=d.group_database_id
  JOIN sys.availability_replicas ar ON ar.replica_id=d.replica_id
  LEFT JOIN sys.dm_hadr_database_replica_cluster_states cs ON cs.replica_id=d.replica_id AND cs.group_database_id=d.group_database_id
- WHERE adc.database_name COLLATE DATABASE_DEFAULT<>@m COLLATE DATABASE_DEFAULT;',
+ WHERE adc.database_name COLLATE DATABASE_DEFAULT<>@m COLLATE DATABASE_DEFAULT
+ AND NOT EXISTS(SELECT 1 FROM #OmittedDatabases x WHERE x.DatabaseName=adc.database_name COLLATE DATABASE_DEFAULT);',
  N'@u datetime2,@s nvarchar(256),@q int,@m sysname',@Utc,@Server,@QueueWarningMB,@MaintenanceDatabase;
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'AG health','NOT CHECKED',ERROR_MESSAGE(),NULL);
@@ -377,7 +493,8 @@ BEGIN TRY
  FROM dbo.CommandLog c
  WHERE c.StartTime>=@since AND c.StartTime<=@now
  AND EXISTS(SELECT 1 FROM sys.databases d WHERE d.database_id>4 AND d.name<>@m
-            AND d.name COLLATE DATABASE_DEFAULT=c.DatabaseName COLLATE DATABASE_DEFAULT);
+            AND d.name COLLATE DATABASE_DEFAULT=c.DatabaseName COLLATE DATABASE_DEFAULT
+            AND NOT EXISTS(SELECT 1 FROM #OmittedDatabases x WHERE x.DatabaseName=d.name COLLATE DATABASE_DEFAULT));
  INSERT INTO #Daily(CheckTimeUtc,ServerName,Resource,CheckName,Status,Finding,Evidence)
  SELECT @u,@s,c.DatabaseName,''Maintenance errors'',''ATTENTION'',
  CONCAT(''Type='',c.CommandType COLLATE DATABASE_DEFAULT,''; error='',c.ErrorNumber,''; failed commands='',COUNT_BIG(*)),
@@ -388,7 +505,8 @@ BEGIN TRY
  FROM dbo.CommandLog c
  WHERE c.StartTime>=@since AND c.StartTime<=@now AND COALESCE(c.ErrorNumber,0)<>0
  AND EXISTS(SELECT 1 FROM sys.databases d WHERE d.database_id>4 AND d.name<>@m
-            AND d.name COLLATE DATABASE_DEFAULT=c.DatabaseName COLLATE DATABASE_DEFAULT)
+            AND d.name COLLATE DATABASE_DEFAULT=c.DatabaseName COLLATE DATABASE_DEFAULT
+            AND NOT EXISTS(SELECT 1 FROM #OmittedDatabases x WHERE x.DatabaseName=d.name COLLATE DATABASE_DEFAULT))
  GROUP BY c.DatabaseName,c.CommandType,c.ErrorNumber;
  IF @incomplete>0
  INSERT INTO #Daily(CheckTimeUtc,ServerName,Resource,CheckName,Status,Finding,Evidence)
