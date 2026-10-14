@@ -1,4 +1,4 @@
-/* DBA DAILY CHECKS v1 | SQL Server 2012-2022 and Azure SQL Managed Instance
+/* DBA DAILY CHECKS v1.8 | SQL Server 2012-2022 and Azure SQL Managed Instance
    Run once per instance in SSMS, preferably first against one server.
    No persistent writes or maintenance. Uses session temp tables only.
    UTC window for XE; backup/job/CommandLog times use server-local GETDATE().
@@ -9,10 +9,12 @@
 SET NOCOUNT ON;
 DECLARE @OldLockTimeout int = @@LOCK_TIMEOUT;
 DECLARE @Hours int=24, @BlockingSeconds int=60,
+        @ExceptionsOnly bit=0, -- 1 = output CRITICAL, ATTENTION, REVIEW and NOT CHECKED only
         @DiskWarningPct decimal(5,2)=15, @DiskCriticalPct decimal(5,2)=10,
         @FileUsedWarningPct decimal(5,2)=90,
         @QueueWarningMB int=1024, -- review thresholds locally before use
-        @MaintenanceDatabase sysname=N'MaintenanceDB', -- Ola CommandLog source; excluded from user-DB results
+        @MaintenanceDatabase sysname=N'MaintenanceDB', -- Ola CommandLog source, excluded from database-level results
+        @IntegrityMaxAgeDays int=7, -- illustrative: last good CHECKDB older than this = ATTENTION; set to your policy
         @ReadErrorLogs bit=0, @ErrorLogArchives int=6,
         @ReadDeadlockFiles bit=0, -- opt-in: retained XE files can be expensive
         @XePattern nvarchar(4000)=NULL; -- optional explicit server-side *.xel path
@@ -22,6 +24,8 @@ DECLARE @Now datetime=GETDATE(), @Utc datetime2=SYSUTCDATETIME(),
         @Engine int=CONVERT(int,SERVERPROPERTY('EngineEdition')),
         @IsHadrEnabled int=CONVERT(int,SERVERPROPERTY('IsHadrEnabled'));
 SET @Since=DATEADD(hour,-@Hours,@Now); SET @SinceUtc=DATEADD(hour,-@Hours,@Utc);
+-- NULL would make every 'name<>@x' test unknown and silently empty the database checks.
+SET @MaintenanceDatabase=ISNULL(@MaintenanceDatabase,N'');
 IF @Hours<1 OR @Hours>168 THROW 50000,'Hours must be between 1 and 168.',1;
 IF @Engine IN (5,6) THROW 50000,'Use the Azure SQL Database script for SQL Database; Synapse is outside scope.',1;
 DECLARE @CanMonitor bit=CASE WHEN HAS_PERMS_BY_NAME(NULL,NULL,'VIEW SERVER STATE')=1
@@ -53,7 +57,8 @@ VALUES
    N'; engine=',@Engine,
    N'; server-local window=',CONVERT(varchar(30),@Since,126),N' to ',CONVERT(varchar(30),@Now,126),
    N'; UTC window=',CONVERT(varchar(30),@SinceUtc,126),N' to ',CONVERT(varchar(30),@Utc,126),
-   N'; database scope=user DBs except ',@MaintenanceDatabase));
+   N'; database scope=user databases except ',@MaintenanceDatabase,
+   N'; script version=1.8'));
 
 -- 01 Database inventory: permissions must cover ALL databases to call coverage complete.
 BEGIN TRY
@@ -66,10 +71,11 @@ BEGIN TRY
           '; recovery=',recovery_model_desc COLLATE DATABASE_DEFAULT,'; read_only=',is_read_only),
    'sys.databases; compare non-ONLINE states with approved exceptions'
   FROM sys.databases WHERE database_id>4 AND name<>@MaintenanceDatabase;
- EXEC sp_executesql N'INSERT #Daily SELECT @u,@s,@s,''Instance start'',''INFO'',
+ EXEC sp_executesql N'INSERT #Daily SELECT @u,@s,@s,''Instance start'',
+   CASE WHEN sqlserver_start_time>=@since THEN ''REVIEW'' ELSE ''INFO'' END,
    CONCAT(''SQL start (server local)='',CONVERT(varchar(30),sqlserver_start_time,126)),
-   ''sys.dm_os_sys_info; latest start only, not restart history'' FROM sys.dm_os_sys_info;',
-   N'@u datetime2,@s nvarchar(256)',@Utc,@Server;
+   ''sys.dm_os_sys_info; REVIEW = restart inside the window; latest start only, not restart history'' FROM sys.dm_os_sys_info;',
+   N'@u datetime2,@s nvarchar(256),@since datetime',@Utc,@Server,@Since;
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Database inventory and start','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
@@ -103,6 +109,33 @@ BEGIN TRY
  N'@u datetime2,@s nvarchar(256),@n datetime,@m sysname',@Utc,@Server,@Now,@MaintenanceDatabase;
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Backup freshness','NOT CHECKED',ERROR_MESSAGE(),NULL);
+END CATCH;
+
+-- 02b Integrity: last good DBCC CHECKDB as recorded by SQL Server, independent of any maintenance solution.
+BEGIN TRY
+ INSERT #Daily SELECT @Utc,@Server,d.name,'Last good CHECKDB',
+  CASE WHEN c.t IS NULL OR c.t<'19010101' THEN 'REVIEW'
+       WHEN c.t<DATEADD(day,-@IntegrityMaxAgeDays,@Now) THEN 'ATTENTION' ELSE 'PASS' END,
+  CONCAT('Last good CHECKDB (server local)=',COALESCE(CONVERT(varchar(30),NULLIF(c.t,'19000101'),126),'none recorded'),
+   '; policy age days=',@IntegrityMaxAgeDays),
+  'DATABASEPROPERTYEX LastGoodCheckDbTime; NULL/none on older versions or never checked; PHYSICAL_ONLY runs may not update it; AG secondaries need review'
+ FROM sys.databases d CROSS APPLY (SELECT TRY_CONVERT(datetime,DATABASEPROPERTYEX(d.name,'LastGoodCheckDbTime'))) c(t)
+ WHERE d.database_id>4 AND d.name<>@MaintenanceDatabase AND d.state=0;
+END TRY BEGIN CATCH
+ INSERT #Daily VALUES(@Utc,@Server,@Server,'Last good CHECKDB','NOT CHECKED',ERROR_MESSAGE(),NULL);
+END CATCH;
+BEGIN TRY
+ EXEC sp_executesql N'
+ DECLARE @n int=(SELECT COUNT(*) FROM msdb.dbo.suspect_pages sp
+ WHERE sp.event_type IN(1,2,3) AND sp.last_update_date>=@since
+ AND EXISTS(SELECT 1 FROM sys.databases d WHERE d.database_id=sp.database_id
+            AND d.database_id>4 AND d.name<>@m));
+ INSERT #Daily VALUES(@u,@s,@s,''Suspect pages'',CASE WHEN @n>0 THEN ''ATTENTION'' ELSE ''PASS'' END,
+ CONCAT(@n,'' suspect_pages rows for in-scope user databases (event types 1-3) updated in the window.''),
+ ''msdb.dbo.suspect_pages; table is capped and cleared manually; PASS is not proof of no corruption'');',
+ N'@u datetime2,@s nvarchar(256),@since datetime,@m sysname',@Utc,@Server,@Since,@MaintenanceDatabase;
+END TRY BEGIN CATCH
+ INSERT #Daily VALUES(@Utc,@Server,@Server,'Suspect pages','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
 
 -- 03 Agent history: include failures even if subsequently retried successfully.
@@ -145,10 +178,31 @@ END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Agent checks','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
 
+-- 03b SQL Agent service state (instances only; not applicable on Managed Instance).
+IF @Engine=8
+ INSERT #Daily VALUES(@Utc,@Server,@Server,'Agent service','N/A','Managed Instance Agent service is platform-managed.',NULL);
+ELSE BEGIN
+ BEGIN TRY
+ IF @CanMonitor=0 RAISERROR('Server monitoring permission missing; service state not visible.',16,1);
+ EXEC sp_executesql N'
+ INSERT #Daily SELECT @u,@s,servicename COLLATE DATABASE_DEFAULT,''Agent service'',
+ CASE WHEN status_desc=''Running'' THEN ''PASS'' ELSE ''ATTENTION'' END,
+ CONCAT(''Status='',status_desc COLLATE DATABASE_DEFAULT,''; startup='',startup_type_desc COLLATE DATABASE_DEFAULT),
+ ''sys.dm_server_services; Agent only''
+ FROM sys.dm_server_services WHERE servicename LIKE N''SQL Server Agent%'';
+ IF @@ROWCOUNT=0 INSERT #Daily VALUES(@u,@s,@s,''Agent service'',''REVIEW'',
+ ''No SQL Server Agent service row visible (Express, Linux or permissions). Confirm Agent is expected.'',NULL);',
+ N'@u datetime2,@s nvarchar(256)',@Utc,@Server;
+END TRY BEGIN CATCH
+ INSERT #Daily VALUES(@Utc,@Server,@Server,'Agent service','NOT CHECKED',ERROR_MESSAGE(),NULL);
+END CATCH;
+END;
+
 -- 04 Host volumes: only volumes containing SQL database files.
 IF @Engine=8
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Host volumes','N/A','Managed Instance host disks are managed by Azure; check Azure storage metrics.',NULL);
-ELSE BEGIN TRY
+ELSE BEGIN
+ BEGIN TRY
  EXEC sp_executesql N'
  ;WITH v AS(SELECT DISTINCT volume_mount_point,total_bytes,available_bytes
  FROM sys.master_files f CROSS APPLY sys.dm_os_volume_stats(f.database_id,f.file_id))
@@ -163,6 +217,7 @@ ELSE BEGIN TRY
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Host volume space','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
+END;
 
 -- Per-database file and log space; offline/inaccessible DBs explicitly surfaced.
 DECLARE @db sysname,@sql nvarchar(max);
@@ -206,7 +261,8 @@ ELSE IF @IsHadrEnabled IS NULL
  INSERT #Daily VALUES(@Utc,@Server,@Server,'AG health','NOT CHECKED',
  'Could not determine whether Availability Groups are enabled.',
  'SERVERPROPERTY(IsHadrEnabled) returned NULL');
-ELSE BEGIN TRY
+ELSE BEGIN
+ BEGIN TRY
  IF @CanMonitor=0 RAISERROR('Server monitoring permission missing; AG results could be incomplete.',16,1);
  IF NOT EXISTS(SELECT 1 FROM sys.availability_groups)
   INSERT #Daily VALUES(@Utc,@Server,@Server,'AG health','REVIEW',
@@ -240,6 +296,7 @@ ELSE BEGIN TRY
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'AG health','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
+END;
 
 -- 06 Current blocking and long-running requests: do not equate elapsed time with blocking time.
 BEGIN TRY
@@ -272,7 +329,8 @@ END CATCH;
 IF @ReadDeadlockFiles=0
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Deadlock history','NOT CHECKED',
  'XE scan disabled. Review retained Redgate/XE history separately or enable after assessing file volume.',NULL);
-ELSE BEGIN TRY
+ELSE BEGIN
+ BEGIN TRY
  IF @XePattern IS NULL BEGIN
   DECLARE @Target xml,@CurrentFile nvarchar(4000);
   SELECT @Target=CONVERT(xml,t.target_data) FROM sys.dm_xe_session_targets t
@@ -305,27 +363,48 @@ ELSE BEGIN TRY
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Deadlock history','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
+END;
 
--- 08 Ola CommandLog outcomes, if installed. Does not prove all expected DBs were checked.
+-- 08 Ola CommandLog: grouped errors; incomplete commands summarised separately.
 BEGIN TRY
  IF DB_ID(@MaintenanceDatabase) IS NULL RAISERROR('Configured maintenance database not visible or absent.',16,1);
  SET @sql=N'USE '+QUOTENAME(@MaintenanceDatabase)+N';
  IF OBJECT_ID(N''dbo.CommandLog'',N''U'') IS NULL RAISERROR(''dbo.CommandLog not found.'',16,1);
- INSERT #Daily SELECT @u,@s,COALESCE(DatabaseName,DB_NAME()),''Maintenance command'',
- CASE WHEN EndTime IS NULL THEN ''REVIEW'' WHEN COALESCE(ErrorNumber,0)<>0 THEN ''ATTENTION'' ELSE ''INFO'' END,
- CONCAT(''Type='',CommandType COLLATE DATABASE_DEFAULT,''; start='',CONVERT(varchar(30),StartTime,126),
- ''; end='',CONVERT(varchar(30),EndTime,126),''; error='',ErrorNumber,
- ''; '',ErrorMessage COLLATE DATABASE_DEFAULT),
- ''dbo.CommandLog; no command SQL text collected'' FROM dbo.CommandLog
- WHERE StartTime>=@since AND DatabaseName IS NOT NULL
- AND DatabaseName COLLATE DATABASE_DEFAULT IN
- (SELECT name COLLATE DATABASE_DEFAULT FROM sys.databases WHERE database_id>4 AND name<>@m);
- IF @@ROWCOUNT=0 INSERT #Daily VALUES(@u,@s,@s,''Maintenance outcomes'',''REVIEW'',
- ''No CommandLog entries for in-scope user databases within window. Confirm schedule and retention.'',NULL);';
- EXEC sp_executesql @sql,N'@u datetime2,@s nvarchar(256),@since datetime,@m sysname',
- @Utc,@Server,@Since,@MaintenanceDatabase;
+ DECLARE @total bigint,@errors bigint,@incomplete bigint;
+ SELECT @total=COUNT_BIG(*),
+ @errors=COALESCE(SUM(CONVERT(bigint,CASE WHEN COALESCE(c.ErrorNumber,0)<>0 THEN 1 ELSE 0 END)),0),
+ @incomplete=COALESCE(SUM(CONVERT(bigint,CASE WHEN c.EndTime IS NULL AND COALESCE(c.ErrorNumber,0)=0 THEN 1 ELSE 0 END)),0)
+ FROM dbo.CommandLog c
+ WHERE c.StartTime>=@since AND c.StartTime<=@now
+ AND EXISTS(SELECT 1 FROM sys.databases d WHERE d.database_id>4 AND d.name<>@m
+            AND d.name COLLATE DATABASE_DEFAULT=c.DatabaseName COLLATE DATABASE_DEFAULT);
+ INSERT INTO #Daily(CheckTimeUtc,ServerName,Resource,CheckName,Status,Finding,Evidence)
+ SELECT @u,@s,c.DatabaseName,''Maintenance errors'',''ATTENTION'',
+ CONCAT(''Type='',c.CommandType COLLATE DATABASE_DEFAULT,''; error='',c.ErrorNumber,''; failed commands='',COUNT_BIG(*)),
+ CONCAT(''First start='',CONVERT(varchar(30),MIN(c.StartTime),126),
+ ''; last start='',CONVERT(varchar(30),MAX(c.StartTime),126),
+ ''; sample error message='',MAX(c.ErrorMessage COLLATE DATABASE_DEFAULT),
+ ''; grouped by database, command type and error number; inspect CommandLog on this instance for all affected objects'')
+ FROM dbo.CommandLog c
+ WHERE c.StartTime>=@since AND c.StartTime<=@now AND COALESCE(c.ErrorNumber,0)<>0
+ AND EXISTS(SELECT 1 FROM sys.databases d WHERE d.database_id>4 AND d.name<>@m
+            AND d.name COLLATE DATABASE_DEFAULT=c.DatabaseName COLLATE DATABASE_DEFAULT)
+ GROUP BY c.DatabaseName,c.CommandType,c.ErrorNumber;
+ IF @incomplete>0
+ INSERT INTO #Daily(CheckTimeUtc,ServerName,Resource,CheckName,Status,Finding,Evidence)
+ VALUES(@u,@s,@s,''Maintenance incomplete'',''REVIEW'',
+ CONCAT(@incomplete,'' commands have no EndTime and no recorded error; may be running or interrupted.''),
+ ''One instance summary for in-scope user databases; inspect CommandLog and Agent jobs before classifying these as failures.'');
+ IF @errors=0 AND @incomplete=0
+ INSERT INTO #Daily(CheckTimeUtc,ServerName,Resource,CheckName,Status,Finding,Evidence)
+ VALUES(@u,@s,@s,''Maintenance outcomes'',CASE WHEN @total=0 THEN ''REVIEW'' ELSE ''PASS'' END,
+ CASE WHEN @total=0 THEN N''No CommandLog entries for in-scope user databases within window. Confirm schedule and retention.''
+ ELSE CONCAT(@total,N'' in-scope user database commands in window; no recorded errors or incomplete commands.'') END,
+ N''dbo.CommandLog; recorded outcomes only, not proof that every expected database was covered'');';
+ EXEC sp_executesql @sql,N'@u datetime2,@s nvarchar(256),@since datetime,@now datetime,@m sysname',
+ @Utc,@Server,@Since,@Now,@MaintenanceDatabase;
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Integrity coverage','REVIEW',
- 'Compare successful DBCC_CHECKDB commands with the expected in-scope user database schedule; log entries alone do not prove complete coverage.',NULL);
+ 'Compare successful DBCC_CHECKDB commands with the expected in-scope user database schedule; the Last good CHECKDB rows above are the direct check.',NULL);
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Maintenance outcomes','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
@@ -333,7 +412,8 @@ END CATCH;
 -- Optional error-log triage. Bounded archive count; keyword matches are candidates.
 IF @ReadErrorLogs=0
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Error log history','NOT CHECKED','Error-log scan disabled; review in monitoring or enable here.',NULL);
-ELSE BEGIN TRY
+ELSE BEGIN
+ BEGIN TRY
  IF @ErrorLogArchives<0 OR @ErrorLogArchives>20 RAISERROR('ErrorLogArchives must be 0 to 20.',16,1);
  IF OBJECT_ID('tempdb..#ErrorLogs') IS NOT NULL DROP TABLE #ErrorLogs;
  CREATE TABLE #ErrorLogs(LogDate datetime, ProcessInfo nvarchar(50), LogText nvarchar(max));
@@ -346,26 +426,36 @@ ELSE BEGIN TRY
   END CATCH;
   SET @Archive=@Archive+1;
  END;
+ INSERT #Daily SELECT @Utc,@Server,@Server,'Login failures',CASE WHEN COUNT(*)>0 THEN 'REVIEW' ELSE 'INFO' END,
+ CONCAT(COUNT(*),' failed-login messages in the scanned window; user names and client addresses are not reproduced here.'),
+ 'xp_readerrorlog; count of lines starting Login failed for user' FROM #ErrorLogs WHERE LogText LIKE 'Login failed for user%';
  INSERT #Daily SELECT @Utc,@Server,@Server,'Error log candidate','REVIEW',
  CONCAT(CONVERT(varchar(30),LogDate,126),' ',ProcessInfo,' ',LogText),
  'Server-local timestamp; keyword triage only; retain surrounding log context'
- FROM #ErrorLogs WHERE LogText LIKE '%Error:%' OR LogText LIKE '%Severity:%'
+ FROM #ErrorLogs WHERE (LogText LIKE '%Error:%' OR LogText LIKE '%Severity:%'
  OR LogText LIKE '%I/O requests taking longer%' OR LogText LIKE '%stack dump%'
- OR LogText LIKE '%fail%' OR LogText LIKE '%corrupt%';
+ OR LogText LIKE '%fail%' OR LogText LIKE '%corrupt%')
+ AND LogText NOT LIKE 'Login failed for user%' AND LogText NOT LIKE 'Error: 18456,%';
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Error log coverage','REVIEW',
- CONCAT('Scanned available archives 0–',@ErrorLogArchives,'. Rotation/deletion, keyword coverage and server-local clock can leave gaps.'),NULL);
+ CONCAT(N'Scanned available archives 0 to ',@ErrorLogArchives,N'. Rotation/deletion, keyword coverage and server-local clock can leave gaps.'),NULL);
 END TRY BEGIN CATCH
  INSERT #Daily VALUES(@Utc,@Server,@Server,'Error log history','NOT CHECKED',ERROR_MESSAGE(),NULL);
 END CATCH;
+END;
 INSERT #Daily VALUES(@Utc,@Server,@Server,'Restore validation','NOT CHECKED',
  'Restore tests run in the test environment. Review the latest test evidence separately; this production script does not execute restores.',NULL);
 INSERT #Daily VALUES(@Utc,@Server,@Server,'External checks','NOT CHECKED',
  'Review retained alerts, security alerts and DR/failover policy separately. Not collected by this script.',NULL);
 -- SET LOCK_TIMEOUT requires a numeric literal. Build it before executing.
-DECLARE @RestoreLockTimeoutSql nvarchar(50);
-SET @RestoreLockTimeoutSql = N'SET LOCK_TIMEOUT ' + CONVERT(nvarchar(11), @OldLockTimeout);
-EXEC sys.sp_executesql @RestoreLockTimeoutSql;
+-- The default (-1) is restored with a literal so it takes effect in this session; verify with SELECT @@LOCK_TIMEOUT.
+IF @OldLockTimeout=-1 SET LOCK_TIMEOUT -1;
+ELSE BEGIN
+ DECLARE @RestoreLockTimeoutSql nvarchar(50);
+ SET @RestoreLockTimeoutSql = N'SET LOCK_TIMEOUT ' + CONVERT(nvarchar(11), @OldLockTimeout);
+ EXEC sys.sp_executesql @RestoreLockTimeoutSql;
+END;
 SELECT CheckTimeUtc,ServerName,Resource,CheckName,Status,Finding,Evidence,
  CAST(NULL AS nvarchar(100)) Ticket,CAST(NULL AS nvarchar(100)) Owner,
  CAST(NULL AS nvarchar(100)) NextUpdate FROM #Daily
+WHERE @ExceptionsOnly=0 OR Status IN ('CRITICAL','ATTENTION','REVIEW','NOT CHECKED')
 ORDER BY CASE Status WHEN 'CRITICAL' THEN 1 WHEN 'ATTENTION' THEN 2 WHEN 'NOT CHECKED' THEN 3 WHEN 'REVIEW' THEN 4 ELSE 5 END,CheckName,Resource;
