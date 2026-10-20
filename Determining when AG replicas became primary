@@ -1,0 +1,86 @@
+
+/*
+
+The AlwaysOn_health Extended Events session records every role change, and the latest PRIMARY_NORMAL event per 
+AG is when that replica last became primary.
+
+Alternative (error log):
+
+EXEC sys.xp_readerrorlog 0, 1, N'changed from', N'PRIMARY_NORMAL';
+
+Use 0 for the current log, then 1, 2 and so on for older ones. 
+This needs no XE parsing, but it is lost when the log recycles.
+
+*/
+
+;WITH ev AS (
+    SELECT CAST(event_data AS xml) AS ed
+    FROM sys.fn_xe_file_target_read_file('AlwaysOn_health*.xel', NULL, NULL, NULL)
+    WHERE object_name = 'availability_replica_state_change'
+),
+p AS (
+    SELECT
+        DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), GETDATE()),
+                ed.value('(event/@timestamp)[1]', 'datetime2')) AS event_time_local,
+        ed.value('(event/data[@name="availability_group_name"]/value)[1]',   'sysname')      AS ag_name,
+        ed.value('(event/data[@name="availability_replica_name"]/value)[1]', 'sysname')      AS replica_name,
+        ed.value('(event/data[@name="previous_state"]/text)[1]',             'varchar(50)')  AS previous_state,
+        ed.value('(event/data[@name="current_state"]/text)[1]',              'varchar(50)')  AS current_state
+    FROM ev
+)
+SELECT ag.name AS ag_name,
+       p.replica_name,
+       MAX(p.event_time_local) AS became_primary_at
+FROM p
+JOIN sys.availability_groups ag ON ag.name = p.ag_name
+JOIN sys.dm_hadr_availability_replica_states rs
+     ON rs.group_id = ag.group_id AND rs.is_local = 1 AND rs.role_desc = 'PRIMARY'
+WHERE p.current_state = 'PRIMARY_NORMAL'
+  AND p.replica_name = @@SERVERNAME
+GROUP BY ag.name, p.replica_name
+ORDER BY became_primary_at DESC;
+
+
+
+
+
+=============================
+
+SET NOCOUNT ON;
+
+;WITH ev AS (
+    SELECT CAST(event_data AS xml) AS ed
+    FROM sys.fn_xe_file_target_read_file('AlwaysOn_health*.xel', NULL, NULL, NULL)
+    WHERE object_name = 'availability_replica_state_change'
+),
+p AS (
+    SELECT
+        ed.value('(event/@timestamp)[1]', 'datetime2')                                       AS event_time_utc,
+        ed.value('(event/data[@name="availability_group_name"]/value)[1]',   'sysname')      AS ag_name,
+        ed.value('(event/data[@name="availability_replica_name"]/value)[1]', 'sysname')      AS replica_name,
+        ed.value('(event/data[@name="current_state"]/text)[1]',              'varchar(50)')  AS current_state
+    FROM ev
+),
+last_primary AS (
+    SELECT ag_name, replica_name, MAX(event_time_utc) AS last_became_primary_utc
+    FROM p
+    WHERE current_state = 'PRIMARY_NORMAL'
+    GROUP BY ag_name, replica_name
+)
+SELECT
+    ag.name                                   AS ag_name,
+    ar.replica_server_name                    AS replica_name,
+    rs.role_desc                              AS current_role,
+    lp.last_became_primary_utc,
+    lp.last_became_primary_utc AT TIME ZONE 'UTC' AT TIME ZONE 'GMT Standard Time' AS last_became_primary_uk,
+    DATEDIFF(DAY, lp.last_became_primary_utc, SYSUTCDATETIME()) AS days_as_primary,
+    (SELECT sqlserver_start_time FROM sys.dm_os_sys_info)       AS sql_start_time
+FROM sys.availability_groups ag
+JOIN sys.dm_hadr_availability_replica_states rs
+     ON rs.group_id = ag.group_id AND rs.is_local = 1
+JOIN sys.availability_replicas ar
+     ON ar.replica_id = rs.replica_id
+LEFT JOIN last_primary lp
+     ON lp.ag_name = ag.name AND lp.replica_name = ar.replica_server_name
+WHERE rs.role_desc = 'PRIMARY'          -- remove this line to see all 12 nodes
+ORDER BY ag.name;
