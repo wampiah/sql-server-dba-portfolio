@@ -1,0 +1,26 @@
+Package dbatools on a machine with PowerShell Gallery access, then copy the ZIP to the machine where you’ll run the AG script. You do not need to install it on all 12 SQL nodes. Save-Module downloads its required dbatools.library dependency too. SQL Server automation with PowerShell
+
+On the internet-connected machine, run:
+$stage = Join-Path $env:TEMP 'dbatools-offline'
+New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+Save-Module -Name dbatools -Path $stage
+
+Get-ChildItem $stage   # Confirm dbatools and dbatools.library
+
+Compress-Archive `
+    -Path "$stage\dbatools", "$stage\dbatools.library" `
+    -DestinationPath "$env:USERPROFILE\Desktop\dbatools-offline.zip"
+
+Transfer dbatools-offline.zip to your DBA workstation or management server. On that destination machine, in Windows PowerShell:
+$moduleRoot = Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\Modules'
+New-Item -ItemType Directory -Path $moduleRoot -Force | Out-Null
+
+Expand-Archive -Path 'C:\Transfer\dbatools-offline.zip' `
+    -DestinationPath $moduleRoot
+
+Get-Module -ListAvailable dbatools, dbatools.library
+Import-Module dbatools -ErrorAction Stop
+Get-Command Invoke-DbaQuery, Copy-DbaLogin
+
+Replace C:\Transfer\dbatools-offline.zip with the ZIP’s actual location. If Get-Module -ListAvailable returns nothing, check $env:PSModulePath -split ';' and extract both module folders into a directory listed there. Keep their version subfolders intact.
