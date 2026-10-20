@@ -24,3 +24,32 @@ Import-Module dbatools -ErrorAction Stop
 Get-Command Invoke-DbaQuery, Copy-DbaLogin
 
 Replace C:\Transfer\dbatools-offline.zip with the ZIP’s actual location. If Get-Module -ListAvailable returns nothing, check $env:PSModulePath -split ';' and extract both module folders into a directory listed there. Keep their version subfolders intact.
+
+
+
+
+
+
+On your laptop, create and locate the ZIP:
+$source = Join-Path $env:TEMP 'dbatools-offline'
+Get-ChildItem $source   # Confirm dbatools and dbatools.library are both present
+
+$zip = Join-Path $env:USERPROFILE 'Desktop\dbatools-offline.zip'
+Compress-Archive -Path "$source\dbatools", "$source\dbatools.library" `
+    -DestinationPath $zip -Force
+
+Get-Item $zip | Select-Object FullName, Length
+
+
+
+Upload that .zip file from your laptop to the destination machine. On the destination, use the location where the upload actually lands:
+
+$zip = 'C:\path\where\you\uploaded\dbatools-offline.zip'
+$moduleRoot = Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\Modules'
+
+New-Item -ItemType Directory -Path $moduleRoot -Force | Out-Null
+Expand-Archive -LiteralPath $zip -DestinationPath $moduleRoot
+
+Get-Module -ListAvailable dbatools, dbatools.library
+Import-Module dbatools -ErrorAction Stop
+Get-Command Invoke-DbaQuery, Copy-DbaLogin
