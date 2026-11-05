@@ -1,0 +1,39 @@
+;WITH DeadlockEvents AS
+(
+    SELECT
+        file_name,
+        file_offset,
+        CAST(event_data AS xml) AS event_xml
+    FROM sys.fn_xe_file_target_read_file(
+        N'YOUR_EXISTING_XEL_PATH',
+        NULL, NULL, NULL
+    )
+    WHERE object_name = N'xml_deadlock_report'
+),
+Classified AS
+(
+    SELECT
+        file_name,
+        file_offset,
+        event_xml.value('(event/@timestamp)[1]', 'datetime2') AS event_time_utc,
+        CASE
+            WHEN event_xml.exist(
+                '/event/data/value/deadlock/resource-list/objectlock
+                 [@objectname="SQLNoes.dbo.SU_ENTITY_PROFILE_VALUES"]'
+            ) = 1
+            AND event_xml.exist(
+                '/event/data/value/deadlock/resource-list/keylock
+                 [@objectname="SQLNoes.dbo.SA_TIMEZONE"]'
+            ) = 1
+            THEN 'SU_ENTITY_PROFILE_VALUES / SA_TIMEZONE'
+            ELSE 'Other pattern'
+        END AS pattern
+    FROM DeadlockEvents
+)
+SELECT
+    CAST(event_time_utc AS date) AS event_date_utc,
+    pattern,
+    COUNT_BIG(*) AS deadlock_events
+FROM Classified
+GROUP BY CAST(event_time_utc AS date), pattern
+ORDER BY event_date_utc DESC, deadlock_events DESC;
