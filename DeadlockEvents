@@ -116,3 +116,29 @@ JOIN #Objects AS B
    AND B.ObjectName > A.ObjectName
 GROUP BY A.ObjectName, B.ObjectName
 ORDER BY DeadlockGraphs DESC;
+
+---------------------------------
+---------------------------------
+
+
+USE vFire;
+GO
+
+SELECT
+    CONVERT(date, SWITCHOFFSET(i.start_time, '+00:00')) AS DayUtc,
+    SUM(rs.count_executions) AS CompletedInserts
+FROM sys.query_store_query_text AS qt
+JOIN sys.query_store_query AS q
+    ON q.query_text_id = qt.query_text_id
+JOIN sys.query_store_plan AS p
+    ON p.query_id = q.query_id
+JOIN sys.query_store_runtime_stats AS rs
+    ON rs.plan_id = p.plan_id
+JOIN sys.query_store_runtime_stats_interval AS i
+    ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+WHERE q.object_id = OBJECT_ID(N'dbo.Sync_SU_ENTITY_PROFILE_VALUES')
+  AND qt.query_sql_text LIKE N'%INSERT%'
+  AND qt.query_sql_text LIKE N'%SU_ENTITY_PROFILE_VALUES%'
+  AND rs.execution_type = 0
+GROUP BY CONVERT(date, SWITCHOFFSET(i.start_time, '+00:00'))
+ORDER BY DayUtc DESC;
