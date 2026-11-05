@@ -50,12 +50,18 @@ ORDER BY event_date_utc DESC, deadlock_events DESC;
 )
 SELECT
     R.Resource.value('local-name(.)', 'sysname') AS ResourceType,
-    R.Resource.value('(@objectname)[1]', 'nvarchar(512)') AS ObjectName,
-    COUNT_BIG(*) AS Occurrences
+    R.Resource.value('(@objectname)[1]', 'nvarchar(512)') AS ObjectName
+INTO #DeadlockResources
 FROM Sample AS S
 CROSS APPLY S.EventXml.nodes('/event/data/value/deadlock/resource-list/*')
-    AS R(Resource)
-GROUP BY
-    R.Resource.value('local-name(.)', 'sysname'),
-    R.Resource.value('(@objectname)[1]', 'nvarchar(512)')
+    AS R(Resource);
+
+SELECT
+    ResourceType,
+    ObjectName,
+    COUNT_BIG(*) AS Occurrences
+FROM #DeadlockResources
+GROUP BY ResourceType, ObjectName
 ORDER BY Occurrences DESC;
+
+DROP TABLE #DeadlockResources;
