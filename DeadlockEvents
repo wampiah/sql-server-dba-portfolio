@@ -65,3 +65,54 @@ GROUP BY ResourceType, ObjectName
 ORDER BY Occurrences DESC;
 
 DROP TABLE #DeadlockResources;
+
+-------------------------------
+-------------------------------
+
+DROP TABLE IF EXISTS #Deadlocks;
+DROP TABLE IF EXISTS #Objects;
+
+SELECT
+    IDENTITY(bigint, 1, 1) AS DeadlockId,
+    timestamp_utc AS EventTimeUtc,
+    CAST(event_data AS xml) AS DeadlockXml
+INTO #Deadlocks
+FROM sys.fn_xe_file_target_read_file(@XelPath, NULL, NULL, NULL)
+WHERE object_name = N'xml_deadlock_report';
+
+SELECT DISTINCT
+    D.DeadlockId,
+    R.Resource.value('(@objectname)[1]', 'nvarchar(512)') AS ObjectName
+INTO #Objects
+FROM #Deadlocks AS D
+CROSS APPLY D.DeadlockXml.nodes(
+    '/event/data/value/deadlock/resource-list/*'
+) AS R(Resource)
+WHERE R.Resource.exist('@objectname') = 1;
+
+-- Coverage: dates and number of captured deadlock graphs
+SELECT
+    MIN(EventTimeUtc) AS FirstEventUtc,
+    MAX(EventTimeUtc) AS LastEventUtc,
+    COUNT_BIG(*) AS DeadlockGraphs
+FROM #Deadlocks;
+
+-- Tables involved, counted once per graph
+SELECT TOP (20)
+    ObjectName,
+    COUNT_BIG(*) AS DeadlockGraphs
+FROM #Objects
+GROUP BY ObjectName
+ORDER BY DeadlockGraphs DESC;
+
+-- Table pairs involved in the same graph
+SELECT TOP (20)
+    A.ObjectName AS Object1,
+    B.ObjectName AS Object2,
+    COUNT_BIG(*) AS DeadlockGraphs
+FROM #Objects AS A
+JOIN #Objects AS B
+    ON B.DeadlockId = A.DeadlockId
+   AND B.ObjectName > A.ObjectName
+GROUP BY A.ObjectName, B.ObjectName
+ORDER BY DeadlockGraphs DESC;
