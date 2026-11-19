@@ -108,21 +108,30 @@ Additional Microsoft references:
 
 
 
-I would keep ownership of the table separate from what is executing the refresh. The internal team has not yet confirmed its reporting activity, and their comment about table creation does not establish who calls the procedure.
-Hi Support Team,
-We have analysed the SQL Server deadlock graphs for the vFire database and would appreciate your help reviewing the profile refresh process.
-Between 7 July and 5 November 2026, we captured 10,931 deadlock graphs. dbo.SU_ENTITY_PROFILE_VALUES appears in 10,620 (97.2%). The two leading table combinations are:
-* SA_TIMEZONE and SU_ENTITY_PROFILE_VALUES: 7,016 graphs
-* ER_TYPE and SU_ENTITY_PROFILE_VALUES: 3,573 graphs
-In a representative graph, an update to SA_TIMEZONE calls Sync_SU_ENTITY_PROFILE_VALUES through a trigger and waits for a schema modification lock on SU_ENTITY_PROFILE_VALUES during TRUNCATE. A concurrent update to ER_TYPE calls the same sync process, holds that lock, and waits for a shared key lock on SA_TIMEZONE.
-Query Store also shows approximately 10,000 completed executions per full day of the INSERT INTO SU_ENTITY_PROFILE_VALUES ... SELECT ... FROM SV_COMBINED_PROFILE statement: 10,242 on 3 November and 9,908 on 4 November. The table currently contains approximately 19,000 rows. We are checking whether each execution represents a full refresh.
-Our internal reporting team has not yet confirmed whether any of its workloads access these objects. We are therefore not attributing the deadlocks to reporting. We have also received initial comments that table creation may not be owned internally, but need to establish ownership of the table, procedure and triggers separately.
-Could you please confirm:
-3. Are SU_ENTITY_PROFILE_VALUES, Sync_SU_ENTITY_PROFILE_VALUES, TimezoneProfileTrigger and ErTypeProfileTrigger supplied and supported as part of ASM/vFire, or are any of them customisations?
-5. Is a full truncate and repopulation expected on updates to SA_TIMEZONE and ER_TYPE? If so, what controls how often it runs?
-6. What supported change would prevent the observed lock cycle—for example, avoiding unnecessary refreshes, changing the transaction design, or refreshing after the originating update commits?
-7. Does our ASM/vFire version support enabling READ_COMMITTED_SNAPSHOT? We recognise that this may reduce the shared read lock in this graph, but the TRUNCATE schema modification lock would remain.
-8. What additional evidence would you need to investigate and provide a supported fix?
-I can provide the representative deadlock XML, object-pair counts, procedure definitions and Query Store results. Given the frequency, we would appreciate this being reviewed as a recurring application-impacting issue.
-Kind regards, William
+# 1. Windows build and patch information
+Get-CimInstance Win32_OperatingSystem |
+Select-Object Caption, Version, BuildNumber, OSArchitecture
+
+Get-ItemProperty `
+'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' |
+Select-Object CurrentBuild, UBR
+
+Get-HotFix |
+Sort-Object InstalledOn -Descending |
+Select-Object -First 5 HotFixID, InstalledOn  # 2. DBNETLIB file version Get-Item `
+C:\Windows\System32\dbnetlib.dll, `
+C:\Windows\SysWOW64\dbnetlib.dll `
+-ErrorAction SilentlyContinue |
+Select-Object FullName,
+@{N='FileVersion';E={$_.VersionInfo.FileVersion}},
+@{N='ProductVersion';E={$_.VersionInfo.ProductVersion}}  # 3. Installed Microsoft OLE DB drivers
+Get-ItemProperty `
+'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' `
+-ErrorAction SilentlyContinue |
+Where-Object {
+    $_.DisplayName -match 'OLE DB|SQL Native Client|ODBC Driver'
+} |
+Select-Object DisplayName, DisplayVersion, Publisher |
+Sort-Object DisplayName
 
