@@ -135,3 +135,24 @@ Where-Object {
 Select-Object DisplayName, DisplayVersion, Publisher |
 Sort-Object DisplayName
 
+
+
+Hi Support Team,
+
+The SQL Server 2022 database platform is a shared corporate environment hosting several application databases. However, Tran is currently the only application reporting connection timeouts.
+
+We would like to investigate beyond the immediate error messages to establish the underlying cause. In particular, we want to:
+
+- Confirm the DBNETLIB connectivity component and its version on the application server.
+- Review the Windows Server and SQL Server patch levels to determine whether any recent updates could be contributing to the issue.
+- Assess compatibility between the application's connectivity provider and SQL Server 2022.
+- Identify any application-specific configuration or connectivity issues that may explain why Tran is affected while other applications remain operational.
+
+At this stage, we have not established whether the issue is related to the connectivity provider, recent updates or another application-specific factor.
+
+Could we arrange a Microsoft Teams meeting next week with the relevant technical teams to review the findings, troubleshoot the connection timeouts and agree on the next steps?
+
+Our priority is to identify the root cause and restore reliable service for our users.
+
+Kind regards,  
+William
